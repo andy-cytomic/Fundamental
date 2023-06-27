@@ -36,26 +36,15 @@ struct Scope : Module {
 	};
 
 	struct Point {
-		float minX[16] = {};
-		float maxX[16] = {};
-		float minY[16] = {};
-		float maxY[16] = {};
-
-		Point() {
-			for (int c = 0; c < 16; c++) {
-				minX[c] = INFINITY;
-				maxX[c] = -INFINITY;
-				minY[c] = INFINITY;
-				maxY[c] = -INFINITY;
-			}
-		}
+		float min = INFINITY;
+		float max = -INFINITY;
 	};
-	Point pointBuffer[BUFFER_SIZE];
+	Point pointBuffer[BUFFER_SIZE][2][PORT_MAX_CHANNELS];
+	Point currentPoint[2][PORT_MAX_CHANNELS];
 	int channelsX = 0;
 	int channelsY = 0;
 	int bufferIndex = 0;
 	int frameIndex = 0;
-	Point currentPoint;
 
 	dsp::SchmittTrigger triggers[16];
 
@@ -85,7 +74,11 @@ struct Scope : Module {
 
 	void onReset() override {
 		for (int i = 0; i < BUFFER_SIZE; i++) {
-			pointBuffer[i] = Point();
+			for (int w = 0; w < 2; w++) {
+				for (int c = 0; c < 16; c++) {
+					pointBuffer[i][w][c] = Point();
+				}
+			}
 		}
 	}
 
@@ -152,27 +145,35 @@ struct Scope : Module {
 		// Add point to buffer if recording
 		if (bufferIndex < BUFFER_SIZE) {
 			// Compute time
-			float deltaTime = std::pow(2.f, -params[TIME_PARAM].getValue()) / BUFFER_SIZE;
+			float deltaTime = dsp::exp2_taylor5(-params[TIME_PARAM].getValue()) / BUFFER_SIZE;
 			int frameCount = (int) std::ceil(deltaTime * args.sampleRate);
 
 			// Get input
 			for (int c = 0; c < channelsX; c++) {
 				float x = inputs[X_INPUT].getVoltage(c);
-				currentPoint.minX[c] = std::min(currentPoint.minX[c], x);
-				currentPoint.maxX[c] = std::max(currentPoint.maxX[c], x);
+				currentPoint[0][c].min = std::min(currentPoint[0][c].min, x);
+				currentPoint[0][c].max = std::max(currentPoint[0][c].max, x);
 			}
 			for (int c = 0; c < channelsY; c++) {
 				float y = inputs[Y_INPUT].getVoltage(c);
-				currentPoint.minY[c] = std::min(currentPoint.minY[c], y);
-				currentPoint.maxY[c] = std::max(currentPoint.maxY[c], y);
+				currentPoint[1][c].min = std::min(currentPoint[1][c].min, y);
+				currentPoint[1][c].max = std::max(currentPoint[1][c].max, y);
 			}
 
 			if (++frameIndex >= frameCount) {
 				frameIndex = 0;
 				// Push current point
-				pointBuffer[bufferIndex] = currentPoint;
+				for (int w = 0; w < 2; w++) {
+					for (int c = 0; c < 16; c++) {
+						pointBuffer[bufferIndex][w][c] = currentPoint[w][c];
+					}
+				}
 				// Reset current point
-				currentPoint = Point();
+				for (int w = 0; w < 2; w++) {
+					for (int c = 0; c < 16; c++) {
+						currentPoint[w][c] = Point();
+					}
+				}
 				bufferIndex++;
 			}
 		}
@@ -199,6 +200,24 @@ struct Scope : Module {
 };
 
 
+Scope::Point DEMO_POINT_BUFFER[BUFFER_SIZE];
+
+void demoPointBufferInit() {
+	static bool init = false;
+	if (init)
+		return;
+	init = true;
+
+	// Calculate demo point buffer
+	for (size_t i = 0; i < BUFFER_SIZE; i++) {
+		float phase = float(i) / BUFFER_SIZE;
+		Scope::Point point;
+		point.min = point.max = 4.f * std::sin(2 * M_PI * phase * 2.f);
+		DEMO_POINT_BUFFER[i] = point;
+	}
+}
+
+
 struct ScopeDisplay : LedDisplay {
 	Scope* module;
 	ModuleWidget* moduleWidget;
@@ -214,33 +233,32 @@ struct ScopeDisplay : LedDisplay {
 
 	ScopeDisplay() {
 		fontPath = asset::system("res/fonts/ShareTechMono-Regular.ttf");
+
+		demoPointBufferInit();
 	}
 
 	void calculateStats(Stats& stats, int wave, int channels) {
-		if (!module)
+		if (!module) {
+			stats.min = -5.f;
+			stats.max = 5.f;
 			return;
+		}
 
 		stats = Stats();
 		for (int i = 0; i < BUFFER_SIZE; i++) {
-			Scope::Point point = module->pointBuffer[i];
 			for (int c = 0; c < channels; c++) {
-				float max = (wave == 0) ? point.maxX[c] : point.maxY[c];
-				float min = (wave == 0) ? point.minX[c] : point.minY[c];
-
-				stats.max = std::fmax(stats.max, max);
-				stats.min = std::fmin(stats.min, min);
+				Scope::Point point = module->pointBuffer[i][wave][c];
+				stats.max = std::fmax(stats.max, point.max);
+				stats.min = std::fmin(stats.min, point.min);
 			}
 		}
 	}
 
 	void drawWave(const DrawArgs& args, int wave, int channel, float offset, float gain) {
-		if (!module)
-			return;
-
-		// Copy point buffer to stack to prevent min/max values being different phase.
-		// This is currently only 256*4*16*4 = 64 kiB.
 		Scope::Point pointBuffer[BUFFER_SIZE];
-		std::copy(std::begin(module->pointBuffer), std::end(module->pointBuffer), std::begin(pointBuffer));
+		for (int i = 0; i < BUFFER_SIZE; i++) {
+			pointBuffer[i] = module ? module->pointBuffer[i][wave][channel] : DEMO_POINT_BUFFER[i];
+		}
 
 		nvgSave(args.vg);
 		Rect b = box.zeroPos().shrink(Vec(0, 15));
@@ -249,7 +267,7 @@ struct ScopeDisplay : LedDisplay {
 		// Draw max points on top
 		for (int i = 0; i < BUFFER_SIZE; i++) {
 			const Scope::Point& point = pointBuffer[i];
-			float max = (wave == 0) ? point.maxX[channel] : point.maxY[channel];
+			float max = point.max;
 			if (!std::isfinite(max))
 				max = 0.f;
 
@@ -266,7 +284,7 @@ struct ScopeDisplay : LedDisplay {
 		// Draw min points on bottom
 		for (int i = BUFFER_SIZE - 1; i >= 0; i--) {
 			const Scope::Point& point = pointBuffer[i];
-			float min = (wave == 0) ? point.minX[channel] : point.minY[channel];
+			float min = point.min;
 			if (!std::isfinite(min))
 				min = 0.f;
 
@@ -290,8 +308,12 @@ struct ScopeDisplay : LedDisplay {
 		if (!module)
 			return;
 
-		Scope::Point pointBuffer[BUFFER_SIZE];
-		std::copy(std::begin(module->pointBuffer), std::end(module->pointBuffer), std::begin(pointBuffer));
+		Scope::Point pointBufferX[BUFFER_SIZE];
+		Scope::Point pointBufferY[BUFFER_SIZE];
+		for (int i = 0; i < BUFFER_SIZE; i++) {
+			pointBufferX[i] = module->pointBuffer[i][0][channel];
+			pointBufferY[i] = module->pointBuffer[i][1][channel];
+		}
 
 		nvgSave(args.vg);
 		Rect b = box.zeroPos().shrink(Vec(0, 15));
@@ -300,9 +322,10 @@ struct ScopeDisplay : LedDisplay {
 		int bufferIndex = module->bufferIndex;
 		for (int i = 0; i < BUFFER_SIZE; i++) {
 			// Get average point
-			const Scope::Point& point = pointBuffer[(i + bufferIndex) % BUFFER_SIZE];
-			float avgX = (point.minX[channel] + point.maxX[channel]) / 2;
-			float avgY = (point.minY[channel] + point.maxY[channel]) / 2;
+			const Scope::Point& pointX = pointBufferX[(i + bufferIndex) % BUFFER_SIZE];
+			const Scope::Point& pointY = pointBufferY[(i + bufferIndex) % BUFFER_SIZE];
+			float avgX = (pointX.min + pointX.max) / 2;
+			float avgY = (pointY.min + pointY.max) / 2;
 			if (!std::isfinite(avgX) || !std::isfinite(avgY))
 				continue;
 
@@ -369,25 +392,25 @@ struct ScopeDisplay : LedDisplay {
 			return;
 		nvgFontSize(args.vg, 13);
 		nvgFontFaceId(args.vg, font->handle);
-		nvgTextLetterSpacing(args.vg, -2);
+		nvgTextLetterSpacing(args.vg, -1);
 
 		nvgFillColor(args.vg, nvgRGBA(0xff, 0xff, 0xff, 0x40));
 		nvgText(args.vg, pos.x + 6, pos.y + 11, title, NULL);
 
 		nvgFillColor(args.vg, nvgRGBA(0xff, 0xff, 0xff, 0x80));
-		pos = pos.plus(Vec(22, 11));
+		pos = pos.plus(Vec(20, 11));
 
 		std::string text;
 		text = "pp ";
 		float pp = stats.max - stats.min;
 		text += isNear(pp, 0.f, 100.f) ? string::f("% 6.2f", pp) : "  ---";
 		nvgText(args.vg, pos.x, pos.y, text.c_str(), NULL);
-		text = "max ";
+		text = "max";
 		text += isNear(stats.max, 0.f, 100.f) ? string::f("% 6.2f", stats.max) : "  ---";
-		nvgText(args.vg, pos.x + 58 * 1, pos.y, text.c_str(), NULL);
-		text = "min ";
+		nvgText(args.vg, pos.x + 60 * 1, pos.y, text.c_str(), NULL);
+		text = "min";
 		text += isNear(stats.min, 0.f, 100.f) ? string::f("% 6.2f", stats.min) : "  ---";
-		nvgText(args.vg, pos.x + 58 * 2, pos.y, text.c_str(), NULL);
+		nvgText(args.vg, pos.x + 60 * 2, pos.y, text.c_str(), NULL);
 	}
 
 	void drawBackground(const DrawArgs& args) {
@@ -415,26 +438,27 @@ struct ScopeDisplay : LedDisplay {
 		// Background lines
 		drawBackground(args);
 
-		if (!module)
-			return;
-
-		float gainX = std::pow(2.f, std::round(module->params[Scope::X_SCALE_PARAM].getValue())) / 10.f;
-		float gainY = std::pow(2.f, std::round(module->params[Scope::Y_SCALE_PARAM].getValue())) / 10.f;
-		float offsetX = module->params[Scope::X_POS_PARAM].getValue();
-		float offsetY = module->params[Scope::Y_POS_PARAM].getValue();
+		float gainX = module ? module->params[Scope::X_SCALE_PARAM].getValue() : 0.f;
+		gainX = std::pow(2.f, std::round(gainX)) / 10.f;
+		float gainY = module ? module->params[Scope::Y_SCALE_PARAM].getValue() : 0.f;
+		gainY = std::pow(2.f, std::round(gainY)) / 10.f;
+		float offsetX = module ? module->params[Scope::X_POS_PARAM].getValue() : 5.f;
+		float offsetY = module ? module->params[Scope::Y_POS_PARAM].getValue() : -5.f;
 
 		// Get input colors
 		PortWidget* inputX = moduleWidget->getInput(Scope::X_INPUT);
 		PortWidget* inputY = moduleWidget->getInput(Scope::Y_INPUT);
 		CableWidget* inputXCable = APP->scene->rack->getTopCable(inputX);
 		CableWidget* inputYCable = APP->scene->rack->getTopCable(inputY);
-		NVGcolor inputXColor = inputXCable ? inputXCable->color : color::WHITE;
-		NVGcolor inputYColor = inputYCable ? inputYCable->color : color::WHITE;
+		NVGcolor inputXColor = inputXCable ? inputXCable->color : SCHEME_YELLOW;
+		NVGcolor inputYColor = inputYCable ? inputYCable->color : SCHEME_YELLOW;
 
 		// Draw waveforms
-		if (module->isLissajous()) {
+		int channelsY = module ? module->channelsY : 1;
+		int channelsX = module ? module->channelsX : 1;
+		if (module && module->isLissajous()) {
 			// X x Y
-			int lissajousChannels = std::min(module->channelsX, module->channelsY);
+			int lissajousChannels = std::min(channelsX, channelsY);
 			for (int c = 0; c < lissajousChannels; c++) {
 				nvgStrokeColor(args.vg, SCHEME_YELLOW);
 				drawLissajous(args, c, offsetX, gainX, offsetY, gainY);
@@ -442,29 +466,30 @@ struct ScopeDisplay : LedDisplay {
 		}
 		else {
 			// Y
-			for (int c = 0; c < module->channelsY; c++) {
+			for (int c = 0; c < channelsY; c++) {
 				nvgFillColor(args.vg, inputYColor);
 				drawWave(args, 1, c, offsetY, gainY);
 			}
 
 			// X
-			for (int c = 0; c < module->channelsX; c++) {
+			for (int c = 0; c < channelsX; c++) {
 				nvgFillColor(args.vg, inputXColor);
 				drawWave(args, 0, c, offsetX, gainX);
 			}
 
 			// Trigger
-			float trigThreshold = module->params[Scope::THRESH_PARAM].getValue();
+			float trigThreshold = module ? module->params[Scope::THRESH_PARAM].getValue() : 0.f;
 			trigThreshold = (trigThreshold + offsetX) * gainX;
 			drawTrig(args, trigThreshold);
 		}
 
 		// Calculate and draw stats
-		if (++statsFrame >= 4) {
-			statsFrame = 0;
-			calculateStats(statsX, 0, module->channelsX);
-			calculateStats(statsY, 1, module->channelsY);
+		if (statsFrame == 0) {
+			calculateStats(statsX, 0, channelsX);
+			calculateStats(statsY, 1, channelsY);
 		}
+		statsFrame = (statsFrame + 1) % 4;
+
 		drawStats(args, Vec(0, 0 + 1), "1", statsX);
 		drawStats(args, Vec(0, box.size.y - 15 - 1), "2", statsY);
 	}

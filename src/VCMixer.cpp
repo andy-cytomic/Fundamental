@@ -26,6 +26,9 @@ struct VCMixer : Module {
 	dsp::VuMeter2 chMeters[4];
 	dsp::ClockDivider lightDivider;
 
+	bool chExp = false;
+	bool mixExp = false;
+
 	VCMixer() {
 		config(0, 0, 0, 0);
 		config(NUM_PARAMS, NUM_INPUTS, NUM_OUTPUTS, NUM_LIGHTS);
@@ -48,88 +51,116 @@ struct VCMixer : Module {
 		lightDivider.setDivision(512);
 	}
 
+	void onReset(const ResetEvent& e) override {
+		chExp = false;
+		mixExp = false;
+		Module::onReset(e);
+	}
+
 	void process(const ProcessArgs& args) override {
+		using simd::float_4;
+
 		// Get number of poly channels for mix output
-		int mixChannels = 1;
+		int channels = 1;
 		for (int i = 0; i < 4; i++) {
-			mixChannels = std::max(mixChannels, inputs[CH_INPUTS + i].getChannels());
+			channels = std::max(channels, inputs[CH_INPUTS + i].getChannels());
 		}
-		float mix[16] = {};
 
-		// Channel strips
-		for (int i = 0; i < 4; i++) {
-			int channels = 1;
-			float in[16] = {};
-			float sum = 0.f;
+		// Iterate polyphony channels (voices)
+		float chSum[4] = {};
 
-			if (inputs[CH_INPUTS + i].isConnected()) {
-				channels = inputs[CH_INPUTS + i].getChannels();
+		for (int c = 0; c < channels; c += 4) {
+			float_4 mix = 0.f;
 
-				// Get input
-				inputs[CH_INPUTS + i].readVoltages(in);
+			// Channel strips
+			for (int i = 0; i < 4; i++) {
+				float_4 out = 0.f;
 
-				// Apply fader gain
-				float gain = std::pow(params[LVL_PARAMS + i].getValue(), 2.f);
-				for (int c = 0; c < channels; c++) {
-					in[c] *= gain;
-				}
+				if (inputs[CH_INPUTS + i].isConnected()) {
+					// Get input
+					out = inputs[CH_INPUTS + i].getPolyVoltageSimd<float_4>(c);
 
-				// Apply CV gain
-				if (inputs[CV_INPUTS + i].isConnected()) {
-					for (int c = 0; c < channels; c++) {
-						float cv = clamp(inputs[CV_INPUTS + i].getPolyVoltage(c) / 10.f, 0.f, 1.f);
-						in[c] *= cv;
+					// Apply fader gain
+					float gain = std::pow(params[LVL_PARAMS + i].getValue(), 2.f);
+					out *= gain;
+
+					// Apply CV gain
+					if (inputs[CV_INPUTS + i].isConnected()) {
+						float_4 cv = inputs[CV_INPUTS + i].getPolyVoltageSimd<float_4>(c) / 10.f;
+						cv = simd::fmax(0.f, cv);
+						if (chExp)
+							cv = (cv * cv) * (cv * cv);
+						out *= cv;
 					}
+
+					// Sum channel for VU meter
+					for (int c2 = 0; c2 < 4; c2++) {
+						chSum[i] += out[c2];
+					}
+
+					// Add to mix
+					mix += out;
 				}
 
-				// Add to mix
-				for (int c = 0; c < channels; c++) {
-					mix[c] += in[c];
-				}
-
-				// Sum channel for VU meter
-				for (int c = 0; c < channels; c++) {
-					sum += in[c];
-				}
+				// Set channel output
+				outputs[CH_OUTPUTS + i].setVoltageSimd(out, c);
 			}
 
-			chMeters[i].process(args.sampleTime, sum / 5.f);
+			// Mix output
+			if (outputs[MIX_OUTPUT].isConnected()) {
+				// Apply mix knob gain
+				float gain = params[MIX_LVL_PARAM].getValue();
+				mix *= gain;
 
-			// Set channel output
-			if (outputs[CH_OUTPUTS + i].isConnected()) {
-				outputs[CH_OUTPUTS + i].setChannels(channels);
-				outputs[CH_OUTPUTS + i].writeVoltages(in);
+				// Apply mix CV gain
+				if (inputs[MIX_CV_INPUT].isConnected()) {
+					float_4 cv = inputs[MIX_CV_INPUT].getPolyVoltageSimd<float_4>(c) / 10.f;
+					cv = simd::fmax(0.f, cv);
+					if (mixExp)
+						cv = (cv * cv) * (cv * cv);
+					mix *= cv;
+				}
+
+				// Set mix output
+				outputs[MIX_OUTPUT].setVoltageSimd(mix, c);
 			}
 		}
 
-		// Mix output
-		if (outputs[MIX_OUTPUT].isConnected()) {
-			// Apply mix knob gain
-			float gain = params[MIX_LVL_PARAM].getValue();
-			for (int c = 0; c < mixChannels; c++) {
-				mix[c] *= gain;
-			}
-
-			// Apply mix CV gain
-			if (inputs[MIX_CV_INPUT].isConnected()) {
-				for (int c = 0; c < mixChannels; c++) {
-					float cv = clamp(inputs[MIX_CV_INPUT].getPolyVoltage(c) / 10.f, 0.f, 1.f);
-					mix[c] *= cv;
-				}
-			}
-
-			// Set mix output
-			outputs[MIX_OUTPUT].setChannels(mixChannels);
-			outputs[MIX_OUTPUT].writeVoltages(mix);
+		// Set output channels
+		for (int i = 0; i < 4; i++) {
+			outputs[CH_OUTPUTS + i].setChannels(channels);
 		}
+		outputs[MIX_OUTPUT].setChannels(channels);
 
 		// VU lights
+		for (int i = 0; i < 4; i++) {
+			chMeters[i].process(args.sampleTime, chSum[i] / 5.f);
+		}
 		if (lightDivider.process()) {
 			for (int i = 0; i < 4; i++) {
-				float b = chMeters[i].getBrightness(-24.f, 0.f);
-				lights[LVL_LIGHTS + i].setBrightness(b);
+				lights[LVL_LIGHTS + i].setBrightness(chMeters[i].getBrightness(-24.f, 0.f));
 			}
 		}
+	}
+
+	json_t* dataToJson() override {
+		json_t* rootJ = json_object();
+		// chExp
+		json_object_set_new(rootJ, "chExp", json_boolean(chExp));
+		// mixExp
+		json_object_set_new(rootJ, "mixExp", json_boolean(mixExp));
+		return rootJ;
+	}
+
+	void dataFromJson(json_t* rootJ) override {
+		// chExp
+		json_t* chExpJ = json_object_get(rootJ, "chExp");
+		if (chExpJ)
+			chExp = json_boolean_value(chExpJ);
+		// mixExp
+		json_t* mixExpJ = json_object_get(rootJ, "mixExp");
+		if (mixExpJ)
+			mixExp = json_boolean_value(mixExpJ);
 	}
 };
 
@@ -165,6 +196,16 @@ struct VCMixerWidget : ModuleWidget {
 		addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(17.441, 113.115)), module, VCMixer::CH_OUTPUTS + 1));
 		addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(28.279, 113.115)), module, VCMixer::CH_OUTPUTS + 2));
 		addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(39.116, 113.115)), module, VCMixer::CH_OUTPUTS + 3));
+	}
+
+	void appendContextMenu(Menu* menu) override {
+		VCMixer* module = getModule<VCMixer>();
+		assert(module);
+
+		menu->addChild(new MenuSeparator);
+
+		menu->addChild(createBoolPtrMenuItem("Exponential channel VCAs", "", &module->chExp));
+		menu->addChild(createBoolPtrMenuItem("Exponential mix VCA", "", &module->mixExp));
 	}
 };
 

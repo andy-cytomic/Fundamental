@@ -94,9 +94,12 @@ struct Random : Module {
 		shape += inputs[SHAPE_INPUT].getVoltage() / 10.f * params[SHAPE_CV_PARAM].getValue();
 		shape = clamp(shape, 0.f, 1.f);
 
-		float rand = params[RAND_PARAM].getValue();
-		rand += inputs[RAND_INPUT].getVoltage() / 10.f * params[RAND_CV_PARAM].getValue();
-		rand = clamp(rand, 0.f, 1.f);
+		float rand = 0.f;
+		if (!inputs[EXTERNAL_INPUT].isConnected()) {
+			rand = params[RAND_PARAM].getValue();
+			rand += inputs[RAND_INPUT].getVoltage() / 10.f * params[RAND_CV_PARAM].getValue();
+			rand = clamp(rand, 0.f, 1.f);
+		}
 
 		bool uni = params[OFFSET_PARAM].getValue() > 0.f;
 
@@ -148,7 +151,7 @@ struct Random : Module {
 			// Advance clock phase by rate
 			float rate = params[RATE_PARAM].getValue();
 			rate += inputs[RATE_PARAM].getVoltage() * params[RATE_CV_PARAM].getValue();
-			clockFreq = std::pow(2.f, rate);
+			clockFreq = dsp::exp2_taylor5(rate);
 			deltaPhase = std::fmin(clockFreq * args.sampleTime, 0.5f);
 			clockPhase += deltaPhase;
 			// Trigger
