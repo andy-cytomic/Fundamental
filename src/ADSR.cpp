@@ -152,6 +152,9 @@ struct ADSR : Module {
 			// Turn off attacking state if envelope is HIGH
 			attacking[c / 4] &= (env[c / 4] < 1.f);
 
+			// clip to maximum of 1
+			env[c / 4] = simd::fmin(env[c / 4], 1.f);
+
 			// Set output
 			outputs[ENVELOPE_OUTPUT].setVoltageSimd(10.f * env[c / 4], c);
 		}

@@ -26,7 +26,7 @@ struct Mixer : Module {
 
 	Mixer() {
 		config(PARAMS_LEN, INPUTS_LEN, OUTPUTS_LEN, LIGHTS_LEN);
-		configParam(LEVEL_PARAM, 0.f, 1.f, 1.f, "Level", "%", 0, 100);
+		configParam(LEVEL_PARAM, 0.f, 1.0f, 0.5f, "Level", "%", 0, 200);
 		for (int i = 0; i < 6; i++)
 			configInput(IN_INPUTS + i, string::f("Channel %d", i + 1));
 		configOutput(OUT_OUTPUT, "Mix");
@@ -42,7 +42,7 @@ struct Mixer : Module {
 				connected++;
 		}
 
-		float gain = params[LEVEL_PARAM].getValue();
+		float gain = 2.f*params[LEVEL_PARAM].getValue();
 		// Invert
 		if (invert) {
 			gain *= -1.f;
